@@ -5,11 +5,36 @@ export const description =
   'This adapter tracks issuance of SWPR token by simply querying the historical supply of' +
   'the token (default 7 days prior), and comparing it to the current supply.'
 
+type AddressVault = {
+  [key: string]: string;
+};
+
+interface AddressExcludeVault {
+  [key: string]: string[];
+};
+
+const tokenAddresses: AddressVault = {
+    "ethereum": "0x6cAcDB97e3fC8136805a9E7c342d866ab77D0957",    // SWAPR Mainnet
+    "arbitrum-one": "0xdE903E2712288A1dA82942DDdF2c20529565aC30" // SWAPR Arbitrum One
+}
+
+const excludeAddresses: AddressExcludeVault = {
+    "ethereum": [
+        "0x519b70055af55a007110b4ff99b0ea33071c720a", // DAO's avatar address on mainnet
+        "0x0000000000000000000000000000000000000000" // AddressZero
+    ],
+    "arbitrum-one": [
+        "0x2B240b523f69b9aF3adb1C5924F6dB849683A394", // DAO's avatar address on arb1
+        "0x3172eDDa6ff8B2b2Fa7FeD40EE1fD92F1F4dd424", // DAO's Swapr wallet scheme address on arb1
+        "0x2b058af96175A847Bf3E5457B3A702F807daDdFd"
+    ]
+}
+
 interface Token {
   id: string
   name: string
-  address: string
-  excludeAddresses?: string[]
+  address: AddressVault
+  excludeAddresses: AddressExcludeVault
   coinGeckoId: string
   icon?: string
   iconType?: string
@@ -20,13 +45,9 @@ interface Token {
 const token: Token = {
     id: 'swapr',
     name: 'Swapr',
-    address: '0x6cAcDB97e3fC8136805a9E7c342d866ab77D0957', // SWAPR Mainnet
+    address: tokenAddresses,
     coinGeckoId: 'swapr',
-    excludeAddresses: [
-        "0x519b70055af55a007110b4ff99b0ea33071c720a", // DAO's avatar address on mainnet
-        "0x0000000000000000000000000000000000001234", // AddressZero
-        "0x2b058af96175A847Bf3E5457B3A702F807daDdFd"
-    ],
+    excludeAddresses: excludeAddresses,
     icon: 'QmYPqFXTqYcynD5hT9sZbsoPZXbvjSfL7WWQPL7EwYAyE5', // NOT THE CORRECT ONE -> TO BE FIXED
     issuanceDescription: 'DXdao is issuing DXD token through a continuous fundraiser and exchanged for ETH following a bonding curve model.',
     website: 'https://swapr.eth.link/'
@@ -34,44 +55,67 @@ const token: Token = {
 
 export async function setup(sdk: Context) {
 
-    /* @notice calls totalSupply of the contract at a specific date
-       @param address, address of the contract
-       @param excludeAddresses, array of addresses
-       @param date, date until which we want to get supply value
-       @returns total token supply
+    /*  @notice calls totalSupply of the contract at a specific date
+        @param token, address of the contract
+        @param network, 'ethereum' or 'arbitrum-one'
+        @param date, date until which we want to get supply value
+        @returns total token supply
     */
-    const getSupply = async (token: string, date: string, excludeAddresses: string[] = []) => {
-        const tokenContract = sdk.ethers.getERC20Contract(token)
+    const tokenBalance = async (token: string, network: string, date: string) => {
+        const tokenContract = sdk.ethers.getERC20Contract(token, network)
 
-        const [supply, excludeBalances] = await Promise.all([
-            tokenContract.totalSupply({ blockTag: date }),
-            Promise.all(excludeAddresses.map((address: string) => tokenContract.balanceOf(address, { blockTag: date }))),
-        ])
+        const supply = await tokenContract.totalSupply({ blockTag: date })
+
+        const decimalUnit = 1e18
+
+        return (supply.toString() / decimalUnit)
+    }
+
+    /*  @notice calls balanceOf of a token for an array of addresses at a specific date 
+        @param token, address of the contract
+        @param addresses, array of addresses
+        @param date, date until which we want to get supply value
+        @returns sum of addresses balances
+    */
+    const tokenAddressesBalance = async (token: string, network: string, date: string, addresses: string[] = []) => {
+        const tokenContract = sdk.ethers.getERC20Contract(token, network)
+
+        const excludeBalances = await Promise.all(addresses.map((address: string) => tokenContract.balanceOf(address, { blockTag: date })))
 
         const decimalUnit = 1e18 // TODO: query decimals
 
-        const excludeTotal = excludeBalances.reduce((total: number, balance: any) => total + (balance.toString() / decimalUnit), 0)
-
-        return (supply.toString() / decimalUnit) - excludeTotal
+        return excludeBalances.reduce((total: number, balance: any) => total + (balance.toString() / decimalUnit), 0)
     }
 
-    /* @notice calculates the average of tokens minted in the supplied period
-       @param address, address of the contract
-       @param excludeAddresses, array of addresses
-       @param coinGeckoId, id of the token in coingecko in order to retrieve the current price
-       @param daysAgo, number of days we want to consider for the avg calculation, defaults to 7
-       @returns average number
+    /*  @notice gets totalSupply for token and substracts balances
+        @param tokenAddress, addressVault with token addresses
+        @param addresses, AddressExcludeVault containing array of addresses for each network
+        @param date, date until which we want to get supply value
+        @returns total token supply substracting balances
     */
-    const getIssuanceData = (address: string, coinGeckoId: string, excludeAddresses: string[]) => async () => {
+    const getSupply = async (tokenAddress: AddressVault, date: string, addresses: AddressExcludeVault) => {
+        const mainnetBalance = await tokenAddressesBalance(tokenAddress["ethereum"], "ethereum", date, addresses["ethereum"])
+        const arbitrumBalance = await tokenAddressesBalance(tokenAddress["arbitrum-one"], "arbitrum-one", date, addresses["arbitrum-one"])
+        const supply = await tokenBalance(tokenAddress["ethereum"], "ethereum", date)
+
+        return supply - mainnetBalance - arbitrumBalance
+    }
+
+    /*  @notice calculates the average of tokens minted in a week period
+        @param tokenAddress, addressVault with token addresses
+        @param adresses, array of addresses
+        @param coinGeckoId, id of the token in coingecko in order to retrieve the current price
+        @returns average number
+    */
+    const getIssuanceData = (tokenAddress: AddressVault, coinGeckoId: string, adresses: AddressExcludeVault) => async () => {
         const today = sdk.date.formatDate(new Date())
         const weekAgo = sdk.date.offsetDaysFormatted(today, -7)
 
         const [price, todaySupply, weekAgoSupply] = await Promise.all([
             sdk.coinGecko.getCurrentPrice(coinGeckoId),
-            getSupply(address, today, excludeAddresses),
-            getSupply(address, weekAgo, excludeAddresses),
+            getSupply(tokenAddress, today, adresses),
+            getSupply(tokenAddress, weekAgo, adresses),
         ])
-        sdk.log.log(`${todaySupply}, ${weekAgoSupply}`)
 
         const oneWeekIssuance = todaySupply - weekAgoSupply
 
@@ -79,32 +123,36 @@ export async function setup(sdk: Context) {
         return sevenDayAvg
     }
 
-    /* @notice calculates rate in which price has chaged for a specific period
-       @param address, address of the contract
-       @param excludeAddresses, array of addresses
-       @param daysAgo, number of days we want to consider for the avg calculation, defaults to 7
-       @returns rate, number
+    /*  @notice calculates rate in which price has chaged for a specific period
+        @param tokenAddress, addressVault with token addresses
+        @param adresses, array of addresses
+        @returns rate, number
     */
-    const getInflationRate = (address: string, excludeAddresses: string[]) => async () => {
+    const getInflationRate = (tokenAddress: AddressVault, addresses: AddressExcludeVault) => async () => {
         const today = sdk.date.formatDate(new Date())
         const weekAgo = sdk.date.offsetDaysFormatted(today, -7)
 
         const [todaySupply, weekAgoSupply] = await Promise.all([
-            getSupply(address, today, excludeAddresses),
-            getSupply(address, weekAgo, excludeAddresses),
+            getSupply(tokenAddress, today, addresses),
+            getSupply(tokenAddress, weekAgo, addresses),
         ])
 
         return ((todaySupply / weekAgoSupply) - 1) * 52
     }
 
-    /* @notice total circulating tokens today
-       @param address, address of the contract
-       @param excludeAddresses, array of addresses
-       @returns number
+    /*  @notice total circulating tokens today
+        @param tokenAddress, addressVault with token addresses
+        @param excludeAddresses, array of addresses
+        @returns number
     */
-    const getSupplyToday = (address: string, excludeAddresses: string[]) => async () => {
+    const getSupplyToday = (tokenAddress: AddressVault, addresses: AddressExcludeVault) => async () => {
         const today = sdk.date.formatDate(new Date())
-        return await getSupply(address, today, excludeAddresses)
+
+        const mainnetBalance = await tokenAddressesBalance(tokenAddress["ethereum"], "ethereum", today, addresses["ethereum"])
+        const arbitrumBalance = await tokenAddressesBalance(tokenAddress["arbitrum-one"], "arbitrum-one", today, addresses["arbitrum-one"])
+        const supply = await tokenBalance(tokenAddress["ethereum"], "ethereum", today)
+
+        return supply - mainnetBalance - arbitrumBalance
     }
 
     sdk.register({
